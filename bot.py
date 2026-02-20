@@ -1,206 +1,210 @@
 # bot.py
 import os
-import asyncio
 import logging
-from PIL import Image, ImageFilter, ImageOps, ImageFile
+import asyncio
+from pathlib import Path
 
+from PIL import Image, ImageOps
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.request import HTTPXRequest
-from telegram.error import TimedOut
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+# =========================
+# إعدادات (ENV)
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# ---------- Logging ----------
+# قالب الشريط السفلي (PNG شفافة) - حط ملفك هنا
+# مثال: assets/ramadan_bar.png
+OVERLAY_PATH = os.getenv("OVERLAY_PATH", "assets/ramadan_bar.png")
+
+# مجلد العمل
+WORKDIR = Path(os.getenv("WORKDIR", "work"))
+WORKDIR.mkdir(parents=True, exist_ok=True)
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("ramdan-bot")
+log = logging.getLogger("ramdan-bot")
 
-# ---------- ENV ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# ✅ القالب الجديد
-TEMPLATE_PATH = "ramdan_cadre.png"
+# =========================
+# أدوات معالجة الصور
+# =========================
+MAX_SIDE = 4096
+MIN_SIDE = 64
 
-TMP_DIR = "tmp"
-WELCOME_TEXT = "✨ ابعث صورتك/صورك… نركّب القالب ونرجعهم لك مباشرة 🌙"
-WAIT_TEXT = "⏳ راني نخدم عليها…"
-ERROR_TEXT = "❌ صرا خطأ أثناء المعالجة. جرّب من جديد."
-ONLY_PHOTO_TEXT = "📌 ابعث صورة فقط ✅"
 
-# ---------- Per-user sequential processing (avoid mixing multiple photos) ----------
-USER_LOCKS: dict[int, asyncio.Lock] = {}
-
-def get_user_lock(user_id: int) -> asyncio.Lock:
-    lock = USER_LOCKS.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        USER_LOCKS[user_id] = lock
-    return lock
-
-# ---------- Template cache ----------
-TEMPLATE_HOLE = None
-TEMPLATE_SIZE = None
-
-def build_black_region_mask(template_rgba: Image.Image, threshold: int = 25) -> Image.Image:
+def normalize_for_telegram(in_path: str) -> str:
     """
-    Mask للمنطقة السوداء (مكان الصورة): الأسود => 255 في الماسك.
+    - يصلح EXIF rotation
+    - يحول RGB
+    - يمنع أبعاد صغيرة جدا / كبيرة جدا
+    - يخرج JPEG جاهز لـ sendPhoto
     """
-    rgb = template_rgba.convert("RGB")
-    src = rgb.getdata()
+    img = Image.open(in_path)
+    img = ImageOps.exif_transpose(img)
 
-    out = []
-    for (r, g, b) in src:
-        out.append(255 if (r <= threshold and g <= threshold and b <= threshold) else 0)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
-    mask = Image.new("L", rgb.size)
-    mask.putdata(out)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=1.2))
-    return mask
+    w, h = img.size
+    log.info("ORIGINAL SIZE: %sx%s", w, h)
 
-def punch_hole_in_template(template_rgba: Image.Image, hole_mask: Image.Image) -> Image.Image:
+    if w < MIN_SIDE or h < MIN_SIDE:
+        scale = max(MIN_SIDE / w, MIN_SIDE / h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        w, h = img.size
+
+    if max(w, h) > MAX_SIDE:
+        img.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
+
+    safe_path = str(Path(in_path).with_suffix("")) + "_tg.jpg"
+    img.save(safe_path, format="JPEG", quality=92, optimize=True)
+    log.info("FINAL SIZE: %sx%s", img.size[0], img.size[1])
+
+    return safe_path
+
+
+def apply_bottom_overlay(photo_path: str, overlay_path: str) -> str:
     """
-    نحول المنطقة السوداء إلى شفافة (Hole) في القالب.
+    يركّب شريط سفلي (PNG شفافة) على الصورة.
+    - overlay يتعدل عرضه تلقائيا على عرض الصورة
+    - يتحط تحت
     """
-    r, g, b, a = template_rgba.split()
-    zero = Image.new("L", template_rgba.size, 0)
-    new_alpha = Image.composite(zero, a, hole_mask)  # mask=255 => alpha=0
-    return Image.merge("RGBA", (r, g, b, new_alpha))
+    base = Image.open(photo_path)
+    base = ImageOps.exif_transpose(base)
 
-def load_template_once():
-    global TEMPLATE_HOLE, TEMPLATE_SIZE
-    if TEMPLATE_HOLE is not None:
+    # نخليها RGBA باش نركب PNG alpha
+    if base.mode != "RGBA":
+        base = base.convert("RGBA")
+
+    if not Path(overlay_path).exists():
+        # إذا ماكانش overlay، نرجع نفس الصورة
+        out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
+        base.save(out_path, format="PNG")
+        return str(out_path)
+
+    overlay = Image.open(overlay_path)
+    if overlay.mode != "RGBA":
+        overlay = overlay.convert("RGBA")
+
+    bw, bh = base.size
+
+    # نعدل overlay على عرض الصورة
+    ow, oh = overlay.size
+    new_oh = max(1, int((bw / ow) * oh))
+    overlay = overlay.resize((bw, new_oh), Image.LANCZOS)
+
+    # نركب تحت
+    y = bh - new_oh
+    if y < 0:
+        # إذا overlay أطول من الصورة، نكبر الصورة أو نقص overlay
+        # هنا نختار نقص overlay لتناسب
+        overlay = overlay.crop((0, 0, bw, bh))
+        y = 0
+
+    composed = base.copy()
+    composed.alpha_composite(overlay, (0, y))
+
+    out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
+    composed.save(out_path, format="PNG")
+    return str(out_path)
+
+
+async def safe_send_photo(update: Update, image_path: str, caption: str = "✅ تفضل 🌙"):
+    """
+    يطبع + يرسل بصورة بعد normalize.
+    إذا رفض Telegram sendPhoto -> يرسل Document تلقائيا.
+    """
+    try:
+        safe_path = normalize_for_telegram(image_path)
+        with open(safe_path, "rb") as f:
+            await update.message.reply_photo(photo=f, caption=caption)
         return
-    template = Image.open(TEMPLATE_PATH).convert("RGBA")
-    TEMPLATE_SIZE = template.size
-    hole_mask = build_black_region_mask(template, threshold=25)
-    TEMPLATE_HOLE = punch_hole_in_template(template, hole_mask)
 
-# ---------- Image helpers ----------
-def center_crop_to_ratio(img: Image.Image, target_ratio: float) -> Image.Image:
-    iw, ih = img.size
-    img_ratio = iw / ih
+    except BadRequest as e:
+        log.exception("PHOTO FAILED, fallback to document: %s", e)
 
-    if img_ratio > target_ratio:
-        new_w = int(ih * target_ratio)
-        left = (iw - new_w) // 2
-        return img.crop((left, 0, left + new_w, ih))
-    else:
-        new_h = int(iw / target_ratio)
-        top = (ih - new_h) // 2
-        return img.crop((0, top, iw, top + new_h))
-
-def prepare_user_image(path: str, out_w: int, out_h: int) -> Image.Image:
-    img = Image.open(path)
-    img = ImageOps.exif_transpose(img)   # يصلح دوران صور الهاتف
-    img = img.convert("RGB")
-
-    # تصغير أولي لتقليل الوقت والحجم
-    img.thumbnail((2200, 2200), Image.LANCZOS)
-
-    # ✅ قص تلقائي 16/9 (بالعرض)
-    img = center_crop_to_ratio(img, 16 / 9)
-
-    # ✅ ثم resize لمقاس القالب بالضبط
-    img = img.resize((out_w, out_h), Image.LANCZOS)
-    return img.convert("RGBA")
-
-def compose_final(user_img_path: str) -> str:
-    load_template_once()
-    tw, th = TEMPLATE_SIZE
-
-    user = prepare_user_image(user_img_path, tw, th)
-    final = Image.alpha_composite(user, TEMPLATE_HOLE).convert("RGB")
-
-    out_path = user_img_path.replace("_in.jpg", "_out.jpg")
-    # جودة أخف شوية لتفادي timeouts في الإرسال
-    final.save(out_path, "JPEG", quality=82, optimize=True, progressive=True)
-    return out_path
-
-# ---------- Bot handlers ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME_TEXT)
-
-async def safe_send_photo(update: Update, out_path: str):
-    # Retry على الإرسال إذا صار timeout
-    for attempt in (1, 2, 3):
+        # fallback: send as document (أقل تشدد)
         try:
-            with open(out_path, "rb") as f:
-                await update.message.reply_photo(photo=f, caption="✅ تفضل 🌙")
-            return
-        except TimedOut:
-            if attempt == 3:
-                raise
-            await asyncio.sleep(2 * attempt)
+            with open(image_path, "rb") as f:
+                await update.message.reply_document(document=f, caption=caption)
+        except Exception:
+            log.exception("Document fallback also failed.")
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    lock = get_user_lock(user_id)
 
-    await update.message.reply_text(WAIT_TEXT)
-
-    async with lock:
-        try:
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id,
-                action=ChatAction.UPLOAD_PHOTO,
-            )
-
-            os.makedirs(TMP_DIR, exist_ok=True)
-            msg_id = update.message.message_id
-            in_path = os.path.join(TMP_DIR, f"{user_id}_{msg_id}_in.jpg")
-
-            photo = update.message.photo[-1]
-            tg_file = await photo.get_file()
-            await tg_file.download_to_drive(in_path)
-
-            out_path = compose_final(in_path)
-            await safe_send_photo(update, out_path)
-
-            # cleanup
-            try:
-                os.remove(in_path)
-                os.remove(out_path)
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error("PHOTO ERROR: %s", e, exc_info=True)
-            await update.message.reply_text(ERROR_TEXT)
-
-async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(ONLY_PHOTO_TEXT)
-
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN ناقص. ضيفه في Railway Variables.")
-
-    if not os.path.exists(TEMPLATE_PATH):
-        raise SystemExit(f"القالب ناقص: {TEMPLATE_PATH}")
-
-    # ✅ timeouts كبار (Railway/شبكة)
-    request = HTTPXRequest(
-        connect_timeout=60,
-        read_timeout=300,
-        write_timeout=300,
-        pool_timeout=60,
+# =========================
+# Handlers
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 مرحبا!\n"
+        "📸 ابعثلي صورة وأنا نركّبلها الشريط الرمضاني السفلي.\n"
+        "✅ النتيجة ترجعلك مباشرة."
     )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
-    app.add_handler(CommandHandler("start", start))
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.chat.send_action(action=ChatAction.UPLOAD_PHOTO)
+
+        # ناخذ أعلى دقة
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+
+        in_path = WORKDIR / f"in_{photo.file_unique_id}.jpg"
+        await file.download_to_drive(custom_path=str(in_path))
+
+        # ركّب overlay
+        out_path = apply_bottom_overlay(str(in_path), OVERLAY_PATH)
+
+        # إرسال آمن
+        await safe_send_photo(update, out_path)
+
+    except Exception:
+        log.exception("PHOTO ERROR")
+        await update.message.reply_text("صار خطأ أثناء معالجة الصورة 😅 جرب صورة أخرى.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📸 ابعثلي صورة برك، وأنا نخدمها.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("GLOBAL ERROR:", exc_info=context.error)
+
+
+# =========================
+# Main
+# =========================
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN ناقص. حطو في Environment Variables.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(~filters.PHOTO, handle_other))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
-    async def error_handler(update, context):
-        logger.error("GLOBAL ERROR:", exc_info=context.error)
+    # مهم لتفادي مشاكل قديمة + يساعد مع بعض حالات conflict
+    # ملاحظة: 409 الحقيقي يجي إذا كاين instance أخرى شغالة، هذا لازم توقفها من الاستضافة.
+    log.info("Application started (polling).")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
-    app.add_error_handler(error_handler)
-
-    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
