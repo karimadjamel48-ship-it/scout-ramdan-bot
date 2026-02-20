@@ -67,31 +67,45 @@ def crop_to_16x9_paysage(img: Image.Image) -> Image.Image:
 # تركيب القالب
 # =======================
 def apply_overlay(photo_path: str) -> str:
-    if not Path(OVERLAY_PATH).exists():
-        raise FileNotFoundError("ramadan_bar.png غير موجود")
+    try:
+        print("STEP 1: Loading overlay")
+        if not Path(OVERLAY_PATH).exists():
+            print("❌ OVERLAY NOT FOUND:", OVERLAY_PATH)
+            return photo_path
 
-    overlay = Image.open(OVERLAY_PATH)
-    overlay = make_black_transparent(overlay)
-    overlay = ImageOps.exif_transpose(overlay).convert("RGBA")
+        overlay = Image.open(OVERLAY_PATH)
+        overlay = make_black_transparent(overlay)
+        overlay = ImageOps.exif_transpose(overlay).convert("RGBA")
+        print("Overlay size:", overlay.size)
 
-    target_w, target_h = overlay.size
+        target_w, target_h = overlay.size
 
-    base = Image.open(photo_path)
-    base = ImageOps.exif_transpose(base).convert("RGBA")
+        print("STEP 2: Loading base image")
+        base = Image.open(photo_path)
+        base = ImageOps.exif_transpose(base).convert("RGBA")
+        print("Base original size:", base.size)
 
-    # 1) قص إلى 16:9
-    base = crop_to_16x9_paysage(base)
+        print("STEP 3: Cropping 16:9")
+        base = crop_to_16x9_paysage(base)
+        print("After crop:", base.size)
 
-    # 2) Resize لمقاس القالب
-    base = base.resize((target_w, target_h), Image.LANCZOS)
+        print("STEP 4: Resizing to overlay size")
+        base = base.resize((target_w, target_h), Image.LANCZOS)
+        print("After resize:", base.size)
 
-    # 3) تركيب
-    result = Image.alpha_composite(base, overlay)
+        print("STEP 5: Compositing")
+        result = Image.alpha_composite(base, overlay)
 
-    out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
-    result.save(out_path, format="PNG")
-    return str(out_path)
+        out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
+        result.save(out_path, format="PNG")
 
+        print("✅ SUCCESS - Saved:", out_path)
+        return str(out_path)
+
+    except Exception as e:
+        print("🔥 APPLY_OVERLAY ERROR:", e)
+        return photo_path
+        
 # =======================
 # تجهيز للإرسال
 # =======================
@@ -157,3 +171,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
