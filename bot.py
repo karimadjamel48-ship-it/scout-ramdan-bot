@@ -26,23 +26,6 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ramadan-bot")
 
 # =======================
-# تحويل الأسود لشفاف
-# =======================
-def make_black_transparent(img: Image.Image, threshold=15):
-    img = img.convert("RGBA")
-    datas = img.getdata()
-    new_data = []
-
-    for r, g, b, a in datas:
-        if r < threshold and g < threshold and b < threshold:
-            new_data.append((0, 0, 0, 0))
-        else:
-            new_data.append((r, g, b, a))
-
-    img.putdata(new_data)
-    return img
-
-# =======================
 # قص مباشر إلى 16:9 (بدون تدوير)
 # =======================
 def crop_to_16x9_paysage(img: Image.Image) -> Image.Image:
@@ -67,44 +50,25 @@ def crop_to_16x9_paysage(img: Image.Image) -> Image.Image:
 # تركيب القالب
 # =======================
 def apply_overlay(photo_path: str) -> str:
-    try:
-        print("STEP 1: Loading overlay")
-        if not Path(OVERLAY_PATH).exists():
-            print("❌ OVERLAY NOT FOUND:", OVERLAY_PATH)
-            return photo_path
+    overlay = Image.open(OVERLAY_PATH).convert("RGBA")
+    target_w, target_h = overlay.size
 
-        overlay = Image.open(OVERLAY_PATH)
-        overlay = make_black_transparent(overlay)
-        overlay = ImageOps.exif_transpose(overlay).convert("RGBA")
-        print("Overlay size:", overlay.size)
+    base = Image.open(photo_path)
+    base = ImageOps.exif_transpose(base).convert("RGBA")
 
-        target_w, target_h = overlay.size
+    # قص 16:9
+    base = crop_to_16x9_paysage(base)
 
-        print("STEP 2: Loading base image")
-        base = Image.open(photo_path)
-        base = ImageOps.exif_transpose(base).convert("RGBA")
-        print("Base original size:", base.size)
+    # Resize فقط
+    base = base.resize((target_w, target_h), Image.LANCZOS)
 
-        print("STEP 3: Cropping 16:9")
-        base = crop_to_16x9_paysage(base)
-        print("After crop:", base.size)
+    # تركيب مباشر
+    result = Image.alpha_composite(base, overlay)
 
-        print("STEP 4: Resizing to overlay size")
-        base = base.resize((target_w, target_h), Image.LANCZOS)
-        print("After resize:", base.size)
+    out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
+    result.save(out_path, format="PNG")
 
-        print("STEP 5: Compositing")
-        result = Image.alpha_composite(base, overlay)
-
-        out_path = WORKDIR / f"out_{Path(photo_path).stem}.png"
-        result.save(out_path, format="PNG")
-
-        print("✅ SUCCESS - Saved:", out_path)
-        return str(out_path)
-
-    except Exception as e:
-        print("🔥 APPLY_OVERLAY ERROR:", e)
-        return photo_path
+    return str(out_path)
         
 # =======================
 # تجهيز للإرسال
@@ -171,4 +135,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
