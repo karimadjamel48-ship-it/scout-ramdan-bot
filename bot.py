@@ -29,6 +29,8 @@ log = logging.getLogger("ramadan-bot")
 # =======================
 # قص 16:9 paysage بدون تدوير
 # =======================
+from PIL import Image, ImageOps
+
 def crop_to_16x9_paysage(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img)
     w, h = img.size
@@ -37,13 +39,20 @@ def crop_to_16x9_paysage(img: Image.Image) -> Image.Image:
     current_ratio = w / h
 
     if current_ratio > target_ratio:
+        # الصورة عريضة بزاف → نقص من الجوانب (مركز عادي)
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
         return img.crop((left, 0, left + new_w, h))
+
     else:
+        # الصورة طولية → نقص من فوق وتحت بنسبة 65% من الفوق
         new_h = int(w / target_ratio)
-        top = (h - new_h) // 2
-        return img.crop((0, top, w, top + new_h))
+        crop_amount = h - new_h
+
+        top_crop = int(crop_amount * 0.65)   # 65% من الفوق
+        bottom = top_crop + new_h
+
+        return img.crop((0, top_crop, w, bottom))
 
 
 # =======================
@@ -157,3 +166,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
