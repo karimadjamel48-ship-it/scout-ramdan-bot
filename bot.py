@@ -1,6 +1,6 @@
 import os
 import asyncio
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -25,13 +25,14 @@ TEMPLATE_PATH = "ramdan_cadre.png"
 
 WELCOME_TEXT = (
     "✨ أهلاً!\n\n"
-    "📸 ابعث صورك (حتى لو أكثر من صورة)، والبوت يركّب القالب ويرجعهم لك واحد بواحد ✅"
+    "📸 ابعث صورك (حتى لو أكثر من صورة)، والبوت يقصّهم تلقائي 16/9 بالعرض "
+    "ويركّب القالب ويرجعهم لك واحد بواحد ✅"
 )
 WAIT_TEXT = "⏳ وصلتني… راني نخدم عليها!"
 ERROR_TEXT = "❌ صرا خطأ أثناء المعالجة. جرّب من جديد."
-ONLY_PHOTO_TEXT = "📌 ابعث صورة/صور فقط باش نركّب عليهم القالب ✅"
+ONLY_PHOTO_TEXT = "📌 ابعث صورة/صور فقط ✅"
 
-# ✅ قفل لكل مستخدم: يخلي المعالجة ديما واحد بواحد
+# ✅ قفل لكل مستخدم: يخلي المعالجة واحد بواحد حتى مع ألبوم/عدة صور
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
@@ -42,22 +43,46 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 # ---------- Image helpers ----------
-def center_crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Center-crop to match aspect ratio then resize (no distortion)."""
+def center_crop_to_ratio(img: Image.Image, target_ratio: float) -> Image.Image:
+    """Center-crop to a target ratio (e.g., 16/9) without distortion."""
     iw, ih = img.size
-    target_ratio = target_w / target_h
     img_ratio = iw / ih
 
     if img_ratio > target_ratio:
+        # image wider -> crop left/right
         new_w = int(ih * target_ratio)
         left = (iw - new_w) // 2
         img = img.crop((left, 0, left + new_w, ih))
     else:
+        # image taller -> crop top/bottom
         new_h = int(iw / target_ratio)
         top = (ih - new_h) // 2
         img = img.crop((0, top, iw, top + new_h))
 
-    return img.resize((target_w, target_h), Image.LANCZOS)
+    return img
+
+def prepare_user_image(path: str, out_w: int, out_h: int) -> Image.Image:
+    """
+    - Fix EXIF rotation
+    - Force 16:9 landscape crop (target ratio)
+    - Resize to template size
+    - Safe downscale for huge images
+    """
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)  # ✅ fixes phone rotations
+    img = img.convert("RGB")
+
+    # ✅ قص 16/9 بالعرض
+    target_ratio = 16 / 9
+    img = center_crop_to_ratio(img, target_ratio)
+
+    # ✅ إذا كانت الصورة ضخمة بزاف، نقصها قبل resize لتفادي مشاكل الذاكرة
+    # (اختياري لكن مفيد)
+    img.thumbnail((5000, 5000), Image.LANCZOS)
+
+    # ✅ Resize لمقاس القالب
+    img = img.resize((out_w, out_h), Image.LANCZOS)
+    return img.convert("RGBA")
 
 def build_black_region_mask(template_rgba: Image.Image, threshold: int = 20) -> Image.Image:
     """Mask للمنطقة السوداء (مكان الصورة): الأسود => 255 في الماسك."""
@@ -85,8 +110,7 @@ def compose_final(user_img_path: str) -> str:
     template = Image.open(TEMPLATE_PATH).convert("RGBA")
     tw, th = template.size
 
-    user = Image.open(user_img_path).convert("RGB")
-    user = center_crop_to_aspect(user, tw, th).convert("RGBA")
+    user = prepare_user_image(user_img_path, tw, th)
 
     hole_mask = build_black_region_mask(template, threshold=20)
     template_hole = punch_hole_in_template(template, hole_mask)
@@ -105,9 +129,6 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Chat ID: {update.effective_chat.id}")
 
 async def process_one_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    معالجة صورة واحدة (تستعمل داخل lock)
-    """
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
 
     os.makedirs("tmp", exist_ok=True)
@@ -122,7 +143,7 @@ async def process_one_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ إرسال النتيجة للمستخدم
     with open(out_path, "rb") as f:
-        await update.message.reply_photo(photo=f, caption="✅ تفضل! صورتك جاهزة 🌙")
+        await update.message.reply_photo(photo=f, caption="✅ تفضل! (قصّ تلقائي 16/9) 🌙")
 
     # (اختياري) نسخة للأدمن
     if ADMIN_CHAT_ID:
@@ -142,13 +163,9 @@ async def process_one_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يستقبل صور كثيرة (حتى ألبوم) ويعالجهم واحد بواحد بفضل lock للمستخدم.
-    """
     user_id = update.effective_user.id
     lock = get_user_lock(user_id)
 
-    # نخلي رسالة خفيفة (ممكن تكثر إذا المستخدم يبعت بزاف، إذا تحب نحيها)
     await update.message.reply_text(WAIT_TEXT)
 
     async with lock:
@@ -172,7 +189,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
 
-    # ✅ أي صورة: تخدم حتى لو جاو بزاف/ألبوم
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(~filters.PHOTO, handle_other))
 
