@@ -1,6 +1,9 @@
 import os
 import asyncio
+import logging
+import traceback
 from PIL import Image, ImageFilter, ImageOps
+
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -18,22 +21,32 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 # ----------------------------------------------------
 
+# ---------- Logging (باش تبان الأخطاء في السجل) ----------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Config ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()  # اختياري
 
 TEMPLATE_PATH = "ramdan_cadre.png"
+TMP_DIR = "/tmp"  # أفضل من tmp/ في الاستضافات
 
 WELCOME_TEXT = (
     "✨ أهلاً!\n\n"
-    "📸 ابعث صورك (حتى لو أكثر من صورة)، والبوت يقصّهم تلقائي 16/9 بالعرض "
-    "ويركّب القالب ويرجعهم لك واحد بواحد ✅"
+    "📸 ابعث صورك (حتى لو أكثر من صورة).\n"
+    "✅ نعمل قص تلقائي 16/9 بالعرض ونركّب القالب ونرجّعهم لك واحد بواحد."
 )
 WAIT_TEXT = "⏳ وصلتني… راني نخدم عليها!"
 ERROR_TEXT = "❌ صرا خطأ أثناء المعالجة. جرّب من جديد."
 ONLY_PHOTO_TEXT = "📌 ابعث صورة/صور فقط ✅"
 
-# ✅ قفل لكل مستخدم: يخلي المعالجة واحد بواحد حتى مع ألبوم/عدة صور
+# ✅ قفل لكل مستخدم: يخلي المعالجة ديما واحد بواحد
 USER_LOCKS: dict[int, asyncio.Lock] = {}
+
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
     lock = USER_LOCKS.get(user_id)
@@ -42,6 +55,7 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
         USER_LOCKS[user_id] = lock
     return lock
 
+
 # ---------- Image helpers ----------
 def center_crop_to_ratio(img: Image.Image, target_ratio: float) -> Image.Image:
     """Center-crop to a target ratio (e.g., 16/9) without distortion."""
@@ -49,46 +63,48 @@ def center_crop_to_ratio(img: Image.Image, target_ratio: float) -> Image.Image:
     img_ratio = iw / ih
 
     if img_ratio > target_ratio:
-        # image wider -> crop left/right
         new_w = int(ih * target_ratio)
         left = (iw - new_w) // 2
         img = img.crop((left, 0, left + new_w, ih))
     else:
-        # image taller -> crop top/bottom
         new_h = int(iw / target_ratio)
         top = (ih - new_h) // 2
         img = img.crop((0, top, iw, top + new_h))
 
     return img
 
+
 def prepare_user_image(path: str, out_w: int, out_h: int) -> Image.Image:
     """
     - Fix EXIF rotation
-    - Force 16:9 landscape crop (target ratio)
+    - Force 16:9 landscape crop
     - Resize to template size
-    - Safe downscale for huge images
+    - Downscale huge images safely
     """
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)  # ✅ fixes phone rotations
     img = img.convert("RGB")
 
     # ✅ قص 16/9 بالعرض
-    target_ratio = 16 / 9
-    img = center_crop_to_ratio(img, target_ratio)
+    img = center_crop_to_ratio(img, 16 / 9)
 
-    # ✅ إذا كانت الصورة ضخمة بزاف، نقصها قبل resize لتفادي مشاكل الذاكرة
-    # (اختياري لكن مفيد)
-    img.thumbnail((5000, 5000), Image.LANCZOS)
+    # ✅ حماية من الصور الضخمة
+    img.thumbnail((6000, 6000), Image.LANCZOS)
 
     # ✅ Resize لمقاس القالب
     img = img.resize((out_w, out_h), Image.LANCZOS)
     return img.convert("RGBA")
 
+
 def build_black_region_mask(template_rgba: Image.Image, threshold: int = 20) -> Image.Image:
-    """Mask للمنطقة السوداء (مكان الصورة): الأسود => 255 في الماسك."""
+    """
+    Mask للمنطقة السوداء (مكان الصورة): الأسود => 255 في الماسك.
+    ✅ بدون getdata (توافق مع Pillow الجديد)
+    """
     rgb = template_rgba.convert("RGB")
     w, h = rgb.size
-    src = rgb.getdata()
+
+    src = rgb.get_flattened_data()  # ✅ بديل getdata()
 
     out = []
     for (r, g, b) in src:
@@ -99,12 +115,14 @@ def build_black_region_mask(template_rgba: Image.Image, threshold: int = 20) -> 
     mask = mask.filter(ImageFilter.GaussianBlur(radius=1.2))
     return mask
 
+
 def punch_hole_in_template(template_rgba: Image.Image, hole_mask: Image.Image) -> Image.Image:
     """نحوّل المنطقة السوداء إلى شفافة في القالب."""
     r, g, b, a = template_rgba.split()
     zero = Image.new("L", template_rgba.size, 0)
     new_alpha = Image.composite(zero, a, hole_mask)  # mask=255 => alpha=0
     return Image.merge("RGBA", (r, g, b, new_alpha))
+
 
 def compose_final(user_img_path: str) -> str:
     template = Image.open(TEMPLATE_PATH).convert("RGBA")
@@ -121,37 +139,49 @@ def compose_final(user_img_path: str) -> str:
     final.save(out_path, "JPEG", quality=92, optimize=True)
     return out_path
 
+
 # ---------- Bot handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME_TEXT)
 
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Chat ID: {update.effective_chat.id}")
 
+
 async def process_one_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+    """معالجة صورة واحدة"""
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
+    )
 
-    os.makedirs("tmp", exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+
     msg_id = update.message.message_id
-    in_path = os.path.join("tmp", f"{update.effective_user.id}_{msg_id}_in.jpg")
+    user_id = update.effective_user.id
+    in_path = os.path.join(TMP_DIR, f"{user_id}_{msg_id}_in.jpg")
 
+    # Download user image
     photo = update.message.photo[-1]
     tg_file = await photo.get_file()
     await tg_file.download_to_drive(in_path)
 
+    # Compose
     out_path = compose_final(in_path)
 
-    # ✅ إرسال النتيجة للمستخدم
+    # ✅ رجّع الصورة للمستخدم
     with open(out_path, "rb") as f:
-        await update.message.reply_photo(photo=f, caption="✅ تفضل! (قصّ تلقائي 16/9) 🌙")
+        await update.message.reply_photo(photo=f, caption="✅ تفضل! (قص تلقائي 16/9) 🌙")
 
     # (اختياري) نسخة للأدمن
     if ADMIN_CHAT_ID:
         username = update.effective_user.username
-        user_line = f"@{username}" if username else f"user_id: {update.effective_user.id}"
+        user_line = f"@{username}" if username else f"user_id: {user_id}"
         caption = f"🟢 صورة جديدة\n🔗 المستخدم: {user_line}"
 
-        await context.bot.send_chat_action(chat_id=int(ADMIN_CHAT_ID), action=ChatAction.UPLOAD_PHOTO)
+        await context.bot.send_chat_action(
+            chat_id=int(ADMIN_CHAT_ID), action=ChatAction.UPLOAD_PHOTO
+        )
         with open(out_path, "rb") as f:
             await context.bot.send_photo(chat_id=int(ADMIN_CHAT_ID), photo=f, caption=caption)
 
@@ -162,7 +192,9 @@ async def process_one_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يستقبل صور كثيرة ويعالجهم واحد بواحد"""
     user_id = update.effective_user.id
     lock = get_user_lock(user_id)
 
@@ -171,18 +203,47 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         try:
             await process_one_photo(update, context)
-        except Exception:
+        except Exception as e:
+            logger.error("PHOTO ERROR: %s", e, exc_info=True)
+
+            # (اختياري) ابعث سبب الخطأ للأدمن (يساعدك بزاف في التشخيص)
+            if ADMIN_CHAT_ID:
+                try:
+                    tb = "".join(
+                        traceback.format_exception(type(e), e, e.__traceback__)
+                    )
+                    await context.bot.send_message(
+                        chat_id=int(ADMIN_CHAT_ID),
+                        text=f"🔥 PHOTO ERROR:\n{tb[:3500]}",
+                    )
+                except Exception:
+                    pass
+
             await update.message.reply_text(ERROR_TEXT)
+
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(ONLY_PHOTO_TEXT)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أي خطأ خارج handlers يبان هنا"""
+    logger.error("GLOBAL ERROR:", exc_info=context.error)
+    if ADMIN_CHAT_ID:
+        try:
+            e = context.error
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"🔥 BOT ERROR:\n{tb[:3500]}")
+        except Exception:
+            pass
+
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN ناقص. ضيفه في Environment Variables.")
 
     if not os.path.exists(TEMPLATE_PATH):
-        raise SystemExit(f"القالب ناقص: {TEMPLATE_PATH}")
+        raise SystemExit(f"القالب ناقص: {TEMPLATE_PATH} (لازم يكون داخل نفس مجلد bot.py)")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -192,7 +253,12 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(~filters.PHOTO, handle_other))
 
+    # ✅ باش أي خطأ يبان في السجل + للأدمن
+    app.add_error_handler(error_handler)
+
+    # ✅ مهم
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
